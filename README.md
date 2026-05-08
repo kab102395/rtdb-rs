@@ -18,7 +18,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-firebase-rtdb = "0.1.0"
+rtdb-rs = "0.1.0"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1.0"
 ```
