@@ -1,9 +1,11 @@
-# firebase-rtdb
+# rtdb-rs
 
 A Rust client for the [Firebase Realtime Database](https://firebase.google.com/docs/database) REST API.
 
-No official Rust client exists for Firebase RTDB. This crate fills that gap — built originally to power a real application backend, then extracted and published for the broader Rust ecosystem.
-
+Built to solve a specific problem: connecting a Rust backend to Firebase RTDB using 
+service account JWT authentication. Existing crates either use simpler auth models 
+or focus on Firestore rather than RTDB. This crate handles the full 
+service account → JWT → OAuth2 token → RTDB REST flow.
 ## Features
 
 - Service account authentication via JWT + OAuth2
