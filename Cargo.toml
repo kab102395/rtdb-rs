@@ -9,7 +9,7 @@ keywords = ["firebase", "rtdb", "realtime-database", "google", "async"]
 categories = ["web-programming", "api-bindings", "database"]
 
 [lib]
-name = "firebase_rtdb"
+name = "rtdb_rs"
 crate-type = ["rlib"]
 
 [dependencies]
