@@ -1,10 +1,10 @@
 [package]
-name = "firebase-rtdb"
+name = "rtdb-rs"
 version = "0.1.0"
 edition = "2021"
 description = "Firebase Realtime Database REST client for Rust — auth, read, write, patch, delete"
 license = "MIT"
-repository = "https://github.com/kab102395/firebase-rtdb-rs"
+repository = "https://github.com/kab102395/rtdb-rs"
 keywords = ["firebase", "rtdb", "realtime-database", "google", "async"]
 categories = ["web-programming", "api-bindings", "database"]
 
