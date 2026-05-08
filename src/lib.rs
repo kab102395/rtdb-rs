@@ -244,3 +244,36 @@ pub async fn delete(
         .map_err(RtdbError::Request)?;
     Ok(())
 }
+
+
+
+
+// Testing
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_field_value() {
+        let v = RtdbFieldValue::string("hello");
+        assert_eq!(v.string_value, Some("hello".to_string()));
+        assert!(v.integer_value.is_none());
+        assert!(v.boolean_value.is_none());
+    }
+
+    #[test]
+    fn integer_field_value() {
+        let v = RtdbFieldValue::integer(42);
+        assert_eq!(v.integer_value, Some(42));
+        assert!(v.string_value.is_none());
+    }
+
+    #[test]
+    fn boolean_field_value() {
+        let v = RtdbFieldValue::boolean(true);
+        assert_eq!(v.boolean_value, Some(true));
+        assert!(v.string_value.is_none());
+    }
+}
