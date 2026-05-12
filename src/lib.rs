@@ -181,6 +181,7 @@ impl FilterValue {
 ///
 /// # Example
 /// ```no_run
+/// # use rtdb_rs::{RtdbClient, FilterValue, RtdbError};
 /// # async fn example() -> Result<(), rtdb_rs::RtdbError> {
 /// # let client = rtdb_rs::RtdbClient::new("https://my-project.firebaseio.com", "token");
 /// let results = client
@@ -382,6 +383,7 @@ impl<'a> GetBuilder<'a> {
 ///
 /// # Example
 /// ```no_run
+/// # use rtdb_rs::{RtdbClient, RtdbError};
 /// # async fn example() -> Result<(), rtdb_rs::RtdbError> {
 /// let client = rtdb_rs::RtdbClient::new(
 ///     "https://my-project.firebaseio.com",
