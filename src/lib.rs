@@ -291,7 +291,7 @@ impl<'a> GetBuilder<'a> {
         self
     }
 
-    fn build_url(&self) -> Result<String, RtdbError> {
+    pub fn build_url(&self) -> Result<String, RtdbError> {
         // shallow cannot be combined with ordering or filtering
         if self.shallow {
             let has_filters = self.order_by.is_some()
