@@ -15,7 +15,7 @@ the real-world gotchas you will hit using the Firebase REST API.
 
 ```toml
 [dependencies]
-rtdb-rs = "0.2"
+rtdb-rs = "0.2.2"
 ```
 
 ---
