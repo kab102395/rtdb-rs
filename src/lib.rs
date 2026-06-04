@@ -98,6 +98,12 @@ pub enum RtdbError {
     #[error("HTTP request failed: {0}")]
     Request(#[from] reqwest::Error),
 
+    #[error("HTTP status error {status}: {body}")]
+    Status {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+
     #[error("Authentication error: {0}")]
     Auth(String),
 
@@ -154,6 +160,17 @@ pub enum RtdbEvent {
     /// Stop listening and re-authenticate before reconnecting.
     Cancel,
 }
+
+fn auth_query_name(token: &str) -> &'static str {
+    // Google OAuth2 access tokens usually start with "ya29".
+    // Firebase ID tokens are JWTs and should continue using "auth".
+    if token.starts_with("ya29.") || token.starts_with("ya29_") || token.starts_with("ya29-") {
+        "access_token"
+    } else {
+        "auth"
+    }
+}
+
 
 // ── SSE Parser ────────────────────────────────────────────────────────────────
 
@@ -357,7 +374,7 @@ impl<'a> GetBuilder<'a> {
 
     /// Build the request URL. Public for debugging — inspect this if a query
     /// is not returning what you expect before calling `.send()` or `.stream()`.
-    pub fn build_url(&self) -> Result<String, RtdbError> {
+        pub fn build_url(&self) -> Result<String, RtdbError> {
         if self.shallow {
             let has_filters = self.order_by.is_some()
                 || self.limit_to_first.is_some()
@@ -373,9 +390,14 @@ impl<'a> GetBuilder<'a> {
                 ));
             }
 
+            let auth_name = auth_query_name(self.token);
+
             return Ok(format!(
-                "{}/{}.json?auth={}&shallow=true",
-                self.base_url, self.path, self.token
+                "{}/{}.json?{}={}&shallow=true",
+                self.base_url,
+                self.path,
+                auth_name,
+                urlencoding::encode(self.token)
             ));
         }
 
@@ -392,25 +414,48 @@ impl<'a> GetBuilder<'a> {
             ));
         }
 
-        let mut params = vec![format!("auth={}", self.token)];
+        let auth_name = auth_query_name(self.token);
+
+        let mut params = vec![format!(
+            "{}={}",
+            auth_name,
+            urlencoding::encode(self.token)
+        )];
 
         if let Some(ref order) = self.order_by {
-            params.push(format!("orderBy={}", order.as_query_param()));
+            params.push(format!(
+                "orderBy={}",
+                urlencoding::encode(&order.as_query_param())
+            ));
         }
+
         if let Some(n) = self.limit_to_first {
             params.push(format!("limitToFirst={}", n));
         }
+
         if let Some(n) = self.limit_to_last {
             params.push(format!("limitToLast={}", n));
         }
+
         if let Some(ref val) = self.start_at {
-            params.push(format!("startAt={}", val.as_query_param()));
+            params.push(format!(
+                "startAt={}",
+                urlencoding::encode(&val.as_query_param())
+            ));
         }
+
         if let Some(ref val) = self.end_at {
-            params.push(format!("endAt={}", val.as_query_param()));
+            params.push(format!(
+                "endAt={}",
+                urlencoding::encode(&val.as_query_param())
+            ));
         }
+
         if let Some(ref val) = self.equal_to {
-            params.push(format!("equalTo={}", val.as_query_param()));
+            params.push(format!(
+                "equalTo={}",
+                urlencoding::encode(&val.as_query_param())
+            ));
         }
 
         Ok(format!(
@@ -636,31 +681,46 @@ impl RtdbClient {
     }
 
     fn url(&self, path: &str) -> String {
-        format!(
-            "{}/{}.json?auth={}",
-            self.base_url,
-            path.trim_matches('/'),
-            self.token
-        )
-    }
+    let auth_name = auth_query_name(&self.token);
+
+    format!(
+        "{}/{}.json?{}={}",
+        self.base_url,
+        path.trim_matches('/'),
+        auth_name,
+        urlencoding::encode(&self.token)
+    )
+}
 
     /// Read a value at `path`. Returns `Value::Null` if the node is empty —
     /// Firebase does not return HTTP 404 for missing nodes.
     pub async fn get(&self, path: &str) -> Result<Value, RtdbError> {
-        let url = self.url(path);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(RtdbError::Request)?;
+    let url = self.url(path);
 
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(RtdbError::NotFound(path.to_string()));
-        }
+    let response = self
+        .client
+        .get(&url)
+        .send()
+        .await
+        .map_err(RtdbError::Request)?;
 
-        response.json::<Value>().await.map_err(RtdbError::Request)
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(RtdbError::NotFound(path.to_string()));
     }
+
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(RtdbError::Auth("unauthorized — check your token".to_string()));
+    }
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+
+        return Err(RtdbError::Status { status, body });
+    }
+
+    response.json::<Value>().await.map_err(RtdbError::Request)
+}
 
     /// Start a filtered query at `path`. Chain filter methods, then call
     /// `.send().await` for a one-shot read or `.stream().await` for real-time events.
@@ -936,17 +996,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn url_with_order_and_limit() {
-        let url = make_builder("orders")
-            .order_by_child("status")
-            .limit_to_last(10)
-            .build_url()
-            .unwrap();
-        assert!(url.contains("orderBy=\"status\""));
-        assert!(url.contains("limitToLast=10"));
-        assert!(!url.contains("limitToFirst"));
-    }
+   #[test]
+fn url_with_order_and_limit() {
+    let url = make_builder("orders")
+        .order_by_child("status")
+        .limit_to_last(10)
+        .build_url()
+        .unwrap();
+
+    assert!(url.contains("orderBy=%22status%22"));
+    assert!(url.contains("limitToLast=10"));
+    assert!(!url.contains("limitToFirst"));
+}
 
     #[test]
     fn url_limit_to_first_clears_limit_to_last() {
@@ -960,15 +1021,16 @@ mod tests {
         assert!(!url.contains("limitToLast"));
     }
 
-    #[test]
-    fn url_equal_to_string_is_quoted() {
-        let url = make_builder("jobs")
-            .order_by_child("status")
-            .equal_to(FilterValue::string("active"))
-            .build_url()
-            .unwrap();
-        assert!(url.contains("equalTo=\"active\""));
-    }
+  #[test]
+fn url_equal_to_string_is_quoted() {
+    let url = make_builder("jobs")
+        .order_by_child("status")
+        .equal_to(FilterValue::string("active"))
+        .build_url()
+        .unwrap();
+
+    assert!(url.contains("equalTo=%22active%22"));
+}
 
     #[test]
     fn url_shallow() {
