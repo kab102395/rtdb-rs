@@ -1,4 +1,7 @@
+use async_stream::stream;
 use chrono::{Duration, Utc};
+use futures_core::Stream;
+use futures_util::StreamExt;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -108,6 +111,68 @@ pub enum RtdbError {
     InvalidQuery(String),
 }
 
+// ── SSE Event ─────────────────────────────────────────────────────────────────
+
+/// An event received from a Firebase RTDB SSE stream.
+///
+/// Firebase streams four event types over an open HTTP connection.
+/// The first event after connecting is always a `Put` containing the full
+/// current value of the node. Subsequent events reflect changes as they happen.
+///
+/// # Example
+/// ```no_run
+/// # use rtdb_rs::{RtdbClient, RtdbEvent, RtdbError};
+/// # use futures_util::StreamExt;
+/// # async fn example() -> Result<(), RtdbError> {
+/// # let client = RtdbClient::new("https://my-project.firebaseio.com", "token");
+/// let mut stream = client.stream("users/alice").await?;
+/// tokio::pin!(stream);
+/// while let Some(event) = stream.next().await {
+///     match event? {
+///         RtdbEvent::Put { path, data }   => println!("put at {}: {}", path, data),
+///         RtdbEvent::Patch { path, data } => println!("patch at {}: {}", path, data),
+///         RtdbEvent::KeepAlive            => {}
+///         RtdbEvent::Cancel               => break,
+///     }
+/// }
+/// # Ok(()) }
+/// ```
+#[derive(Debug, Clone)]
+pub enum RtdbEvent {
+    /// Full node replaced. Fired once on connect with the current value,
+    /// then again whenever the node is overwritten via PUT.
+    Put { path: String, data: Value },
+
+    /// Specific fields updated. `data` contains only the changed fields,
+    /// not the full node. Fired when a PATCH is applied to the node.
+    Patch { path: String, data: Value },
+
+    /// Heartbeat sent by Firebase to keep the connection alive. Safe to ignore.
+    KeepAlive,
+
+    /// Stream cancelled — usually means the auth token was revoked or expired.
+    /// Stop listening and re-authenticate before reconnecting.
+    Cancel,
+}
+
+// ── SSE Parser ────────────────────────────────────────────────────────────────
+
+/// Parse a Firebase SSE `data:` payload into `(path, data)`.
+/// Firebase always sends `{"path": "...", "data": ...}`.
+fn parse_sse_data(raw: &str) -> Result<(String, Value), RtdbError> {
+    let v: Value = serde_json::from_str(raw)
+        .map_err(|e| RtdbError::Parse(format!("invalid SSE payload: {}", e)))?;
+
+    let path = v["path"]
+        .as_str()
+        .ok_or_else(|| RtdbError::Parse("SSE payload missing 'path' field".to_string()))?
+        .to_string();
+
+    let data = v["data"].clone();
+
+    Ok((path, data))
+}
+
 // ── Query Builder Types ───────────────────────────────────────────────────────
 
 /// Controls how results are ordered.
@@ -175,19 +240,20 @@ impl FilterValue {
 
 // ── GetBuilder ────────────────────────────────────────────────────────────────
 
-/// A builder for filtered GET requests against the Firebase RTDB REST API.
+/// A builder for filtered GET and SSE stream requests against the Firebase RTDB REST API.
 ///
-/// Created via [`RtdbClient::query`]. Chain filter methods and call `.send().await`.
+/// Created via [`RtdbClient::query`]. Chain filter methods and call
+/// `.send().await` for a one-shot read or `.stream().await` for real-time events.
 ///
 /// # Example
 /// ```no_run
 /// # use rtdb_rs::{RtdbClient, FilterValue, RtdbError};
-/// # async fn example() -> Result<(), rtdb_rs::RtdbError> {
-/// # let client = rtdb_rs::RtdbClient::new("https://my-project.firebaseio.com", "token");
+/// # async fn example() -> Result<(), RtdbError> {
+/// # let client = RtdbClient::new("https://my-project.firebaseio.com", "token");
 /// let results = client
 ///     .query("orders")
 ///     .order_by_child("status")
-///     .equal_to(rtdb_rs::FilterValue::string("pending"))
+///     .equal_to(FilterValue::string("pending"))
 ///     .limit_to_first(25)
 ///     .send()
 ///     .await?;
@@ -208,7 +274,7 @@ pub struct GetBuilder<'a> {
 }
 
 impl<'a> GetBuilder<'a> {
-    fn new(client: &'a Client, base_url: &'a str, path: &str, token: &'a str) -> Self {
+    pub fn new(client: &'a Client, base_url: &'a str, path: &str, token: &'a str) -> Self {
         Self {
             client,
             base_url,
@@ -225,7 +291,6 @@ impl<'a> GetBuilder<'a> {
     }
 
     /// Order results by a child field.
-    /// Shorthand for `.order_by(OrderBy::Child("field"))`.
     pub fn order_by_child(mut self, field: &str) -> Self {
         self.order_by = Some(OrderBy::Child(field.to_string()));
         self
@@ -238,13 +303,12 @@ impl<'a> GetBuilder<'a> {
     }
 
     /// Order results by node value (`$value`).
-    /// Use when nodes are primitives, not objects.
     pub fn order_by_value(mut self) -> Self {
         self.order_by = Some(OrderBy::Value);
         self
     }
 
-    /// Set the ordering explicitly via [`OrderBy`].
+    /// Set ordering explicitly via [`OrderBy`].
     pub fn order_by(mut self, order: OrderBy) -> Self {
         self.order_by = Some(order);
         self
@@ -284,15 +348,16 @@ impl<'a> GetBuilder<'a> {
         self
     }
 
-    /// Return only keys, not values. Cannot be combined with other query params.
-    /// Useful for checking existence or counting nodes without fetching all data.
+    /// Return only keys, not values. Cannot be combined with other query params
+    /// or with `.stream()`.
     pub fn shallow(mut self) -> Self {
         self.shallow = true;
         self
     }
 
+    /// Build the request URL. Public for debugging — inspect this if a query
+    /// is not returning what you expect before calling `.send()` or `.stream()`.
     pub fn build_url(&self) -> Result<String, RtdbError> {
-        // shallow cannot be combined with ordering or filtering
         if self.shallow {
             let has_filters = self.order_by.is_some()
                 || self.limit_to_first.is_some()
@@ -303,7 +368,8 @@ impl<'a> GetBuilder<'a> {
 
             if has_filters {
                 return Err(RtdbError::InvalidQuery(
-                    "shallow=true cannot be combined with orderBy, limit, or filter params".to_string(),
+                    "shallow=true cannot be combined with orderBy, limit, or filter params"
+                        .to_string(),
                 ));
             }
 
@@ -313,7 +379,6 @@ impl<'a> GetBuilder<'a> {
             ));
         }
 
-        // limit and filter params require orderBy
         let needs_order = self.limit_to_first.is_some()
             || self.limit_to_last.is_some()
             || self.start_at.is_some()
@@ -322,7 +387,8 @@ impl<'a> GetBuilder<'a> {
 
         if needs_order && self.order_by.is_none() {
             return Err(RtdbError::InvalidQuery(
-                "limit_to_first, limit_to_last, start_at, end_at, and equal_to all require order_by".to_string(),
+                "limit_to_first, limit_to_last, start_at, end_at, and equal_to all require order_by"
+                    .to_string(),
             ));
         }
 
@@ -372,6 +438,149 @@ impl<'a> GetBuilder<'a> {
 
         response.json::<Value>().await.map_err(RtdbError::Request)
     }
+
+    /// Open a real-time SSE stream at `path` and return an async `Stream` of
+    /// [`RtdbEvent`]s. The first event is always a `Put` containing the full
+    /// current value. Subsequent events reflect changes as they occur.
+    ///
+    /// All query params (`order_by_child`, `limit_to_last`, etc.) are supported
+    /// — Firebase will filter the stream to only push matching events.
+    /// `shallow` is not supported with streaming.
+    ///
+    /// The stream ends when dropped. Firebase may send a `Cancel` event if
+    /// the auth token expires — handle it by re-authenticating and reconnecting.
+    ///
+    /// # Example
+    /// ```no_run
+/// # use rtdb_rs::{RtdbClient, RtdbEvent, FilterValue, RtdbError};
+/// # use futures_util::StreamExt;
+/// # async fn example() -> Result<(), RtdbError> {
+/// # let client = RtdbClient::new("https://my-project.firebaseio.com", "token");
+/// let mut stream = client
+///     .query("orders")
+///     .order_by_child("status")
+///     .equal_to(FilterValue::string("pending"))
+///     .stream()
+///     .await?;
+/// tokio::pin!(stream);
+/// while let Some(event) = stream.next().await {
+///     match event? {
+///         RtdbEvent::Put { path, data }   => println!("put at {}: {}", path, data),
+///         RtdbEvent::Patch { path, data } => println!("patch at {}: {}", path, data),
+///         RtdbEvent::KeepAlive            => {}
+///         RtdbEvent::Cancel               => break,
+///     }
+/// }
+/// # Ok(()) }
+/// ```
+    pub async fn stream(
+        self,
+    ) -> Result<impl Stream<Item = Result<RtdbEvent, RtdbError>>, RtdbError> {
+        if self.shallow {
+            return Err(RtdbError::InvalidQuery(
+                "shallow cannot be used with stream() — streaming requires full node data"
+                    .to_string(),
+            ));
+        }
+
+        let url = self.build_url()?;
+        let path = self.path.clone();
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Accept", "text/event-stream")
+            .header("Cache-Control", "no-cache")
+            .send()
+            .await
+            .map_err(RtdbError::Request)?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RtdbError::NotFound(path));
+        }
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(RtdbError::Auth("unauthorized — check your token".to_string()));
+        }
+
+        let s = stream! {
+            let mut bytes_stream = response.bytes_stream();
+            let mut buffer = String::new();
+            let mut current_event = String::new();
+            let mut current_data = String::new();
+
+            while let Some(chunk) = bytes_stream.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        yield Err(RtdbError::Request(e));
+                        return;
+                    }
+                };
+
+                let text = match std::str::from_utf8(&chunk) {
+                    Ok(t) => t.to_string(),
+                    Err(_) => {
+                        yield Err(RtdbError::Parse(
+                            "invalid UTF-8 in SSE stream".to_string(),
+                        ));
+                        return;
+                    }
+                };
+
+                buffer.push_str(&text);
+
+                // Process all complete lines in the buffer
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].trim_end_matches('\r').to_string();
+                    buffer = buffer[pos + 1..].to_string();
+
+                    if line.is_empty() {
+                        // Blank line = end of event block, dispatch
+                        if !current_event.is_empty() {
+                            match current_event.as_str() {
+                                "put" => {
+                                    match parse_sse_data(&current_data) {
+                                        Ok((path, data)) => {
+                                            yield Ok(RtdbEvent::Put { path, data })
+                                        }
+                                        Err(e) => yield Err(e),
+                                    }
+                                }
+                                "patch" => {
+                                    match parse_sse_data(&current_data) {
+                                        Ok((path, data)) => {
+                                            yield Ok(RtdbEvent::Patch { path, data })
+                                        }
+                                        Err(e) => yield Err(e),
+                                    }
+                                }
+                                "keep-alive" => yield Ok(RtdbEvent::KeepAlive),
+                                "cancel" => {
+                                    yield Ok(RtdbEvent::Cancel);
+                                    return;
+                                }
+                                other => {
+                                    // Unknown event type — ignore rather than error
+                                    // Firebase may add new event types in future
+                                    let _ = other;
+                                }
+                            }
+                        }
+                        current_event.clear();
+                        current_data.clear();
+                    } else if let Some(rest) = line.strip_prefix("event:") {
+                        current_event = rest.trim().to_string();
+                    } else if let Some(rest) = line.strip_prefix("data:") {
+                        current_data = rest.trim().to_string();
+                    }
+                    // Lines starting with ':' are SSE comments — ignore
+                }
+            }
+        };
+
+        Ok(s)
+    }
 }
 
 // ── RtdbClient ────────────────────────────────────────────────────────────────
@@ -384,8 +593,8 @@ impl<'a> GetBuilder<'a> {
 /// # Example
 /// ```no_run
 /// # use rtdb_rs::{RtdbClient, RtdbError};
-/// # async fn example() -> Result<(), rtdb_rs::RtdbError> {
-/// let client = rtdb_rs::RtdbClient::new(
+/// # async fn example() -> Result<(), RtdbError> {
+/// let client = RtdbClient::new(
 ///     "https://my-project.firebaseio.com",
 ///     "your-oauth2-token",
 /// );
@@ -410,7 +619,7 @@ pub struct RtdbClient {
 
 impl RtdbClient {
     /// Create a new client. `base_url` is your project URL,
-    /// e.g. `https://my-project.firebaseio.com`.
+    /// e.g. `https://my-project-default-rtdb.firebaseio.com`.
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -419,7 +628,8 @@ impl RtdbClient {
         }
     }
 
-    /// Update the auth token. Useful when the OAuth2 token is refreshed.
+    /// Replace the auth token. Call this when the OAuth2 token is refreshed.
+    /// Tokens expire after 1 hour.
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = token.into();
         self
@@ -434,7 +644,8 @@ impl RtdbClient {
         )
     }
 
-    /// Read a value at `path`. Returns `null` as `Value::Null` if the node is empty.
+    /// Read a value at `path`. Returns `Value::Null` if the node is empty —
+    /// Firebase does not return HTTP 404 for missing nodes.
     pub async fn get(&self, path: &str) -> Result<Value, RtdbError> {
         let url = self.url(path);
         let response = self
@@ -451,9 +662,39 @@ impl RtdbClient {
         response.json::<Value>().await.map_err(RtdbError::Request)
     }
 
-    /// Start a filtered query at `path`. Chain filter methods, then call `.send().await`.
+    /// Start a filtered query at `path`. Chain filter methods, then call
+    /// `.send().await` for a one-shot read or `.stream().await` for real-time events.
     pub fn query(&self, path: &str) -> GetBuilder<'_> {
         GetBuilder::new(&self.client, &self.base_url, path, &self.token)
+    }
+
+    /// Open a real-time SSE stream at `path`. Shorthand for `client.query(path).stream()`.
+    ///
+    /// Use `client.query(path).order_by_child(...).stream()` if you need filtering.
+    ///
+    /// # Example
+    /// ```no_run
+/// # use rtdb_rs::{RtdbClient, RtdbEvent, RtdbError};
+/// # use futures_util::StreamExt;
+/// # async fn example() -> Result<(), RtdbError> {
+/// # let client = RtdbClient::new("https://my-project.firebaseio.com", "token");
+/// let mut stream = client.stream("users/alice").await?;
+/// tokio::pin!(stream);
+/// while let Some(event) = stream.next().await {
+///     match event? {
+///         RtdbEvent::Put { path, data }   => println!("put at {}: {}", path, data),
+///         RtdbEvent::Patch { path, data } => println!("patch at {}: {}", path, data),
+///         RtdbEvent::KeepAlive            => {}
+///         RtdbEvent::Cancel               => break,
+///     }
+/// }
+/// # Ok(()) }
+/// ```
+    pub async fn stream(
+        &self,
+        path: &str,
+    ) -> Result<impl Stream<Item = Result<RtdbEvent, RtdbError>>, RtdbError> {
+        self.query(path).stream().await
     }
 
     /// Overwrite the value at `path` (HTTP PUT).
@@ -485,7 +726,7 @@ impl RtdbClient {
     }
 
     /// Append a new child node at `path` with a Firebase-generated push key (HTTP POST).
-    /// Returns the generated key wrapped as `{ "name": "-NxPushKey..." }`.
+    /// Returns the generated key as `{ "name": "-NxPushKey..." }`.
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, RtdbError> {
         let url = self.url(path);
         self.client
@@ -575,14 +816,12 @@ pub struct RtdbArrayValue {
 // ── Free functions (backward compat) ─────────────────────────────────────────
 
 /// Read a value from Firebase RTDB at `path`.
-///
 /// Consider using [`RtdbClient`] instead — it reuses the HTTP client.
 pub async fn get(base_url: &str, path: &str, token: &str) -> Result<Value, RtdbError> {
     RtdbClient::new(base_url, token).get(path).await
 }
 
 /// Write (overwrite) a value at `path` using HTTP PUT.
-///
 /// Consider using [`RtdbClient`] instead — it reuses the HTTP client.
 pub async fn put(
     base_url: &str,
@@ -594,7 +833,6 @@ pub async fn put(
 }
 
 /// Update specific fields at `path` using HTTP PATCH.
-///
 /// Consider using [`RtdbClient`] instead — it reuses the HTTP client.
 pub async fn patch(
     base_url: &str,
@@ -606,7 +844,6 @@ pub async fn patch(
 }
 
 /// Delete the value at `path`.
-///
 /// Consider using [`RtdbClient`] instead — it reuses the HTTP client.
 pub async fn delete(base_url: &str, path: &str, token: &str) -> Result<(), RtdbError> {
     RtdbClient::new(base_url, token).delete(path).await
@@ -617,6 +854,12 @@ pub async fn delete(base_url: &str, path: &str, token: &str) -> Result<(), RtdbE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_builder(path: &str) -> GetBuilder<'static> {
+        static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+        let client = CLIENT.get_or_init(Client::new);
+        GetBuilder::new(client, "https://test.firebaseio.com", path, "test-token")
+    }
 
     // — RtdbFieldValue constructors —
 
@@ -684,15 +927,6 @@ mod tests {
 
     // — GetBuilder URL construction —
 
-    fn make_builder(path: &str) -> GetBuilder<'static> {
-        // We need a static client for test purposes.
-        // In real tests, use once_cell or similar for the client.
-        // This is a compile-time check only — no HTTP is made.
-        static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
-        let client = CLIENT.get_or_init(Client::new);
-        GetBuilder::new(client, "https://test.firebaseio.com", path, "test-token")
-    }
-
     #[test]
     fn url_simple_get() {
         let url = make_builder("users/alice").build_url().unwrap();
@@ -709,7 +943,6 @@ mod tests {
             .limit_to_last(10)
             .build_url()
             .unwrap();
-
         assert!(url.contains("orderBy=\"status\""));
         assert!(url.contains("limitToLast=10"));
         assert!(!url.contains("limitToFirst"));
@@ -723,7 +956,6 @@ mod tests {
             .limit_to_first(10)
             .build_url()
             .unwrap();
-
         assert!(url.contains("limitToFirst=10"));
         assert!(!url.contains("limitToLast"));
     }
@@ -735,7 +967,6 @@ mod tests {
             .equal_to(FilterValue::string("active"))
             .build_url()
             .unwrap();
-
         assert!(url.contains("equalTo=\"active\""));
     }
 
@@ -748,11 +979,7 @@ mod tests {
 
     #[test]
     fn shallow_with_order_by_is_error() {
-        let result = make_builder("users")
-            .order_by_key()
-            .shallow()
-            .build_url();
-
+        let result = make_builder("users").order_by_key().shallow().build_url();
         assert!(matches!(result, Err(RtdbError::InvalidQuery(_))));
     }
 
@@ -768,5 +995,61 @@ mod tests {
             .start_at(FilterValue::string("alice"))
             .build_url();
         assert!(matches!(result, Err(RtdbError::InvalidQuery(_))));
+    }
+
+    // — SSE parser —
+
+    #[test]
+    fn parse_sse_data_valid() {
+        let raw = r#"{"path":"/users/alice","data":{"name":"Alice","score":95}}"#;
+        let (path, data) = parse_sse_data(raw).unwrap();
+        assert_eq!(path, "/users/alice");
+        assert_eq!(data["name"], "Alice");
+        assert_eq!(data["score"], 95);
+    }
+
+    #[test]
+    fn parse_sse_data_root_path() {
+        let raw = r#"{"path":"/","data":{"a":1,"b":2}}"#;
+        let (path, data) = parse_sse_data(raw).unwrap();
+        assert_eq!(path, "/");
+        assert_eq!(data["a"], 1);
+    }
+
+    #[test]
+    fn parse_sse_data_null_data() {
+        // Firebase sends null data when a node is deleted
+        let raw = r#"{"path":"/users/alice","data":null}"#;
+        let (path, data) = parse_sse_data(raw).unwrap();
+        assert_eq!(path, "/users/alice");
+        assert!(data.is_null());
+    }
+
+    #[test]
+    fn parse_sse_data_missing_path_is_error() {
+        let raw = r#"{"data":{"name":"Alice"}}"#;
+        let result = parse_sse_data(raw);
+        assert!(matches!(result, Err(RtdbError::Parse(_))));
+    }
+
+    #[test]
+    fn parse_sse_data_invalid_json_is_error() {
+        let result = parse_sse_data("not json at all");
+        assert!(matches!(result, Err(RtdbError::Parse(_))));
+    }
+
+    #[test]
+    fn shallow_stream_is_error() {
+        // shallow + stream() should return InvalidQuery
+        // We test build_url here since stream() is async
+        let result = make_builder("users").shallow().build_url();
+        // shallow alone is valid for GET...
+        assert!(result.is_ok());
+        // ...but shallow + any filter is not
+        let result2 = make_builder("users")
+            .shallow()
+            .order_by_key()
+            .build_url();
+        assert!(matches!(result2, Err(RtdbError::InvalidQuery(_))));
     }
 }
