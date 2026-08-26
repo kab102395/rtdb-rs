@@ -5,13 +5,18 @@ Firebase Realtime Database REST client for Rust. Handles service account auth, C
 [![Crates.io](https://img.shields.io/crates/v/rtdb-rs.svg)](https://crates.io/crates/rtdb-rs)
 [![Docs.rs](https://docs.rs/rtdb-rs/badge.svg)](https://docs.rs/rtdb-rs)
 
+`rtdb-rs` is an async Firebase Realtime Database REST client with reusable
+clients, typed query construction, CRUD helpers, push-key writes, and
+Server-Sent Events (SSE) streaming. Version 0.3.2 also supports emulator
+namespaces and persistent query parameters.
+
 ---
 
 ## Installation
 
 ```toml
 [dependencies]
-rtdb-rs = "0.3"
+rtdb-rs = "0.3.2"
 ```
 
 ---
@@ -61,6 +66,20 @@ public access:
 let client = RtdbClient::new("http://127.0.0.1:9000", "")
     .with_namespace("demo-rtdb-typed");
 ```
+
+`with_namespace()` is applied to every REST and SSE request. This is useful for
+running multiple isolated Firebase emulator databases from one emulator
+process. Use `with_query_param()` for parameters that should persist across
+all requests, such as emulator auth overrides:
+
+```rust
+let client = RtdbClient::new("http://127.0.0.1:9000", "")
+    .with_namespace("demo-rtdb-typed")
+    .with_query_param("auth_variable_override", r#"{"uid":"test-user"}"#);
+```
+
+Namespace names, parameter names, and parameter values are percent-encoded.
+When the token is empty, no `auth=` or `access_token=` parameter is added.
 
 ---
 
@@ -148,6 +167,10 @@ let keys = client
     .send()
     .await?;
 ```
+
+The client’s namespace and persistent query parameters are preserved by query
+builders, including filtered and shallow queries. Call `build_url()` to inspect
+the resulting encoded URL before sending it.
 
 Supported filter values:
 
@@ -341,6 +364,22 @@ Firebase missing nodes usually return JSON `null`. They do not normally produce 
 
 ## Live Testing
 
+### Local Firebase emulator
+
+The repository includes an ignored integration test covering namespaced CRUD,
+namespace isolation, filtered queries, URL encoding, empty-token requests,
+SSE initial and mutation events, SSE fan-out, and concurrent CRUD stress.
+Firebase CLI, Node.js, Java, and Rust are required:
+
+```bash
+./scripts/test-emulator.sh
+```
+
+The runner refuses non-demo project IDs and refuses to start if ports 9000 or
+4000 are already in use. Set `FIREBASE_PROJECT_ID` only to another `demo-*`
+project when needed. The test uses the local database emulator and does not
+contact production Firebase.
+
 A separate live test harness can be used against a real Firebase Realtime Database project.
 
 Set:
@@ -387,6 +426,15 @@ The live harness validates:
 ---
 
 ## Changelog
+
+### 0.3.2
+
+* Added `RtdbClient::with_namespace()` for Firebase emulator database namespaces.
+* Added `RtdbClient::with_query_param()` for persistent custom REST/SSE query parameters.
+* Propagated namespace and persistent parameters through direct CRUD, filtered queries, shallow queries, and SSE streams.
+* Omitted authentication query parameters when the client token is empty, enabling public emulator rules.
+* Added emulator integration and concurrency stress coverage.
+* Added continuous integration checks for formatting, Clippy, tests, and crate packaging.
 
 ### 0.3.1
 
