@@ -22,10 +22,7 @@ struct Claims {
 
 /// Generate a signed JWT for Firebase service account authentication.
 /// Pass the RSA private key PEM string and the service account client email.
-pub async fn generate_jwt(
-    private_key: &str,
-    client_email: &str,
-) -> Result<String, RtdbError> {
+pub async fn generate_jwt(private_key: &str, client_email: &str) -> Result<String, RtdbError> {
     let now = Utc::now();
     let exp = now
         .checked_add_signed(Duration::seconds(3600))
@@ -45,8 +42,7 @@ pub async fn generate_jwt(
     let key = EncodingKey::from_rsa_pem(private_key.as_bytes())
         .map_err(|e| RtdbError::Auth(e.to_string()))?;
     let header = Header::new(jsonwebtoken::Algorithm::RS256);
-    let token = encode(&header, &claims, &key)
-        .map_err(|e| RtdbError::Auth(e.to_string()))?;
+    let token = encode(&header, &claims, &key).map_err(|e| RtdbError::Auth(e.to_string()))?;
 
     Ok(token)
 }
@@ -171,7 +167,6 @@ fn auth_query_name(token: &str) -> &'static str {
     }
 }
 
-
 // ── SSE Parser ────────────────────────────────────────────────────────────────
 
 /// Parse a Firebase SSE `data:` payload into `(path, data)`.
@@ -281,6 +276,8 @@ pub struct GetBuilder<'a> {
     base_url: &'a str,
     path: String,
     token: &'a str,
+    namespace: Option<String>,
+    query_params: Vec<(String, String)>,
     order_by: Option<OrderBy>,
     limit_to_first: Option<u32>,
     limit_to_last: Option<u32>,
@@ -292,11 +289,24 @@ pub struct GetBuilder<'a> {
 
 impl<'a> GetBuilder<'a> {
     pub fn new(client: &'a Client, base_url: &'a str, path: &str, token: &'a str) -> Self {
+        Self::new_with_options(client, base_url, path, token, None, &[])
+    }
+
+    fn new_with_options(
+        client: &'a Client,
+        base_url: &'a str,
+        path: &str,
+        token: &'a str,
+        namespace: Option<&str>,
+        query_params: &[(String, String)],
+    ) -> Self {
         Self {
             client,
             base_url,
             path: path.trim_matches('/').to_string(),
             token,
+            namespace: namespace.map(str::to_owned),
+            query_params: query_params.to_vec(),
             order_by: None,
             limit_to_first: None,
             limit_to_last: None,
@@ -374,7 +384,7 @@ impl<'a> GetBuilder<'a> {
 
     /// Build the request URL. Public for debugging — inspect this if a query
     /// is not returning what you expect before calling `.send()` or `.stream()`.
-        pub fn build_url(&self) -> Result<String, RtdbError> {
+    pub fn build_url(&self) -> Result<String, RtdbError> {
         if self.shallow {
             let has_filters = self.order_by.is_some()
                 || self.limit_to_first.is_some()
@@ -392,12 +402,26 @@ impl<'a> GetBuilder<'a> {
 
             let auth_name = auth_query_name(self.token);
 
+            let mut params = Vec::new();
+            if let Some(namespace) = &self.namespace {
+                params.push(format!("ns={}", urlencoding::encode(namespace)));
+            }
+            params.extend(self.query_params.iter().map(|(name, value)| {
+                format!(
+                    "{}={}",
+                    urlencoding::encode(name),
+                    urlencoding::encode(value)
+                )
+            }));
+            if !self.token.is_empty() {
+                params.push(format!("{}={}", auth_name, urlencoding::encode(self.token)));
+            }
+            params.push("shallow=true".to_string());
             return Ok(format!(
-                "{}/{}.json?{}={}&shallow=true",
+                "{}/{}.json?{}",
                 self.base_url,
                 self.path,
-                auth_name,
-                urlencoding::encode(self.token)
+                params.join("&")
             ));
         }
 
@@ -416,11 +440,20 @@ impl<'a> GetBuilder<'a> {
 
         let auth_name = auth_query_name(self.token);
 
-        let mut params = vec![format!(
-            "{}={}",
-            auth_name,
-            urlencoding::encode(self.token)
-        )];
+        let mut params = Vec::new();
+        if let Some(namespace) = &self.namespace {
+            params.push(format!("ns={}", urlencoding::encode(namespace)));
+        }
+        params.extend(self.query_params.iter().map(|(name, value)| {
+            format!(
+                "{}={}",
+                urlencoding::encode(name),
+                urlencoding::encode(value)
+            )
+        }));
+        if !self.token.is_empty() {
+            params.push(format!("{}={}", auth_name, urlencoding::encode(self.token)));
+        }
 
         if let Some(ref order) = self.order_by {
             params.push(format!(
@@ -497,27 +530,27 @@ impl<'a> GetBuilder<'a> {
     ///
     /// # Example
     /// ```no_run
-/// # use rtdb_rs::{RtdbClient, RtdbEvent, FilterValue, RtdbError};
-/// # use futures_util::StreamExt;
-/// # async fn example() -> Result<(), RtdbError> {
-/// # let client = RtdbClient::new("https://my-project.firebaseio.com", "token");
-/// let mut stream = client
-///     .query("orders")
-///     .order_by_child("status")
-///     .equal_to(FilterValue::string("pending"))
-///     .stream()
-///     .await?;
-/// tokio::pin!(stream);
-/// while let Some(event) = stream.next().await {
-///     match event? {
-///         RtdbEvent::Put { path, data }   => println!("put at {}: {}", path, data),
-///         RtdbEvent::Patch { path, data } => println!("patch at {}: {}", path, data),
-///         RtdbEvent::KeepAlive            => {}
-///         RtdbEvent::Cancel               => break,
-///     }
-/// }
-/// # Ok(()) }
-/// ```
+    /// # use rtdb_rs::{RtdbClient, RtdbEvent, FilterValue, RtdbError};
+    /// # use futures_util::StreamExt;
+    /// # async fn example() -> Result<(), RtdbError> {
+    /// # let client = RtdbClient::new("https://my-project.firebaseio.com", "token");
+    /// let mut stream = client
+    ///     .query("orders")
+    ///     .order_by_child("status")
+    ///     .equal_to(FilterValue::string("pending"))
+    ///     .stream()
+    ///     .await?;
+    /// tokio::pin!(stream);
+    /// while let Some(event) = stream.next().await {
+    ///     match event? {
+    ///         RtdbEvent::Put { path, data }   => println!("put at {}: {}", path, data),
+    ///         RtdbEvent::Patch { path, data } => println!("patch at {}: {}", path, data),
+    ///         RtdbEvent::KeepAlive            => {}
+    ///         RtdbEvent::Cancel               => break,
+    ///     }
+    /// }
+    /// # Ok(()) }
+    /// ```
     pub async fn stream(
         self,
     ) -> Result<impl Stream<Item = Result<RtdbEvent, RtdbError>>, RtdbError> {
@@ -545,7 +578,9 @@ impl<'a> GetBuilder<'a> {
         }
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(RtdbError::Auth("unauthorized — check your token".to_string()));
+            return Err(RtdbError::Auth(
+                "unauthorized — check your token".to_string(),
+            ));
         }
 
         let s = stream! {
@@ -659,6 +694,8 @@ impl<'a> GetBuilder<'a> {
 pub struct RtdbClient {
     base_url: String,
     token: String,
+    namespace: Option<String>,
+    query_params: Vec<(String, String)>,
     client: Client,
 }
 
@@ -669,6 +706,8 @@ impl RtdbClient {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
+            namespace: None,
+            query_params: Vec::new(),
             client: Client::new(),
         }
     }
@@ -680,52 +719,94 @@ impl RtdbClient {
         self
     }
 
-    fn url(&self, path: &str) -> String {
-    let auth_name = auth_query_name(&self.token);
+    /// Set a persistent Firebase database namespace, such as the project ID
+    /// required by the local Realtime Database emulator.
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
+        self
+    }
 
-    format!(
-        "{}/{}.json?{}={}",
-        self.base_url,
-        path.trim_matches('/'),
-        auth_name,
-        urlencoding::encode(&self.token)
-    )
-}
+    /// Add a persistent query parameter to every REST and SSE request.
+    ///
+    /// The name and value are URL-encoded. This is useful for Firebase
+    /// emulator parameters such as `auth_variable_override`, while remaining
+    /// general enough for other Firebase REST options.
+    pub fn with_query_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.query_params.push((name.into(), value.into()));
+        self
+    }
+
+    fn url(&self, path: &str) -> String {
+        let auth_name = auth_query_name(&self.token);
+        let mut params = Vec::new();
+        if let Some(namespace) = &self.namespace {
+            params.push(format!("ns={}", urlencoding::encode(namespace)));
+        }
+        params.extend(self.query_params.iter().map(|(name, value)| {
+            format!(
+                "{}={}",
+                urlencoding::encode(name),
+                urlencoding::encode(value)
+            )
+        }));
+        if !self.token.is_empty() {
+            params.push(format!(
+                "{}={}",
+                auth_name,
+                urlencoding::encode(&self.token)
+            ));
+        }
+        format!(
+            "{}/{}.json?{}",
+            self.base_url,
+            path.trim_matches('/'),
+            params.join("&")
+        )
+    }
 
     /// Read a value at `path`. Returns `Value::Null` if the node is empty —
     /// Firebase does not return HTTP 404 for missing nodes.
     pub async fn get(&self, path: &str) -> Result<Value, RtdbError> {
-    let url = self.url(path);
+        let url = self.url(path);
 
-    let response = self
-        .client
-        .get(&url)
-        .send()
-        .await
-        .map_err(RtdbError::Request)?;
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(RtdbError::Request)?;
 
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(RtdbError::NotFound(path.to_string()));
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RtdbError::NotFound(path.to_string()));
+        }
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(RtdbError::Auth(
+                "unauthorized — check your token".to_string(),
+            ));
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+
+            return Err(RtdbError::Status { status, body });
+        }
+
+        response.json::<Value>().await.map_err(RtdbError::Request)
     }
-
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(RtdbError::Auth("unauthorized — check your token".to_string()));
-    }
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-
-        return Err(RtdbError::Status { status, body });
-    }
-
-    response.json::<Value>().await.map_err(RtdbError::Request)
-}
 
     /// Start a filtered query at `path`. Chain filter methods, then call
     /// `.send().await` for a one-shot read or `.stream().await` for real-time events.
     pub fn query(&self, path: &str) -> GetBuilder<'_> {
-        GetBuilder::new(&self.client, &self.base_url, path, &self.token)
+        GetBuilder::new_with_options(
+            &self.client,
+            &self.base_url,
+            path,
+            &self.token,
+            self.namespace.as_deref(),
+            &self.query_params,
+        )
     }
 
     /// Open a real-time SSE stream at `path`. Shorthand for `client.query(path).stream()`.
@@ -734,22 +815,22 @@ impl RtdbClient {
     ///
     /// # Example
     /// ```no_run
-/// # use rtdb_rs::{RtdbClient, RtdbEvent, RtdbError};
-/// # use futures_util::StreamExt;
-/// # async fn example() -> Result<(), RtdbError> {
-/// # let client = RtdbClient::new("https://my-project.firebaseio.com", "token");
-/// let mut stream = client.stream("users/alice").await?;
-/// tokio::pin!(stream);
-/// while let Some(event) = stream.next().await {
-///     match event? {
-///         RtdbEvent::Put { path, data }   => println!("put at {}: {}", path, data),
-///         RtdbEvent::Patch { path, data } => println!("patch at {}: {}", path, data),
-///         RtdbEvent::KeepAlive            => {}
-///         RtdbEvent::Cancel               => break,
-///     }
-/// }
-/// # Ok(()) }
-/// ```
+    /// # use rtdb_rs::{RtdbClient, RtdbEvent, RtdbError};
+    /// # use futures_util::StreamExt;
+    /// # async fn example() -> Result<(), RtdbError> {
+    /// # let client = RtdbClient::new("https://my-project.firebaseio.com", "token");
+    /// let mut stream = client.stream("users/alice").await?;
+    /// tokio::pin!(stream);
+    /// while let Some(event) = stream.next().await {
+    ///     match event? {
+    ///         RtdbEvent::Put { path, data }   => println!("put at {}: {}", path, data),
+    ///         RtdbEvent::Patch { path, data } => println!("patch at {}: {}", path, data),
+    ///         RtdbEvent::KeepAlive            => {}
+    ///         RtdbEvent::Cancel               => break,
+    ///     }
+    /// }
+    /// # Ok(()) }
+    /// ```
     pub async fn stream(
         &self,
         path: &str,
@@ -996,18 +1077,30 @@ mod tests {
         );
     }
 
-   #[test]
-fn url_with_order_and_limit() {
-    let url = make_builder("orders")
-        .order_by_child("status")
-        .limit_to_last(10)
-        .build_url()
-        .unwrap();
+    #[test]
+    fn empty_auth_is_omitted_and_extra_params_are_encoded() {
+        let client = RtdbClient::new("http://127.0.0.1:9000", "")
+            .with_namespace("demo-rtdb-typed")
+            .with_query_param("print", "hello world");
+        let url = client.query("users").build_url().unwrap();
+        assert_eq!(
+            url,
+            "http://127.0.0.1:9000/users.json?ns=demo-rtdb-typed&print=hello%20world"
+        );
+    }
 
-    assert!(url.contains("orderBy=%22status%22"));
-    assert!(url.contains("limitToLast=10"));
-    assert!(!url.contains("limitToFirst"));
-}
+    #[test]
+    fn url_with_order_and_limit() {
+        let url = make_builder("orders")
+            .order_by_child("status")
+            .limit_to_last(10)
+            .build_url()
+            .unwrap();
+
+        assert!(url.contains("orderBy=%22status%22"));
+        assert!(url.contains("limitToLast=10"));
+        assert!(!url.contains("limitToFirst"));
+    }
 
     #[test]
     fn url_limit_to_first_clears_limit_to_last() {
@@ -1021,16 +1114,16 @@ fn url_with_order_and_limit() {
         assert!(!url.contains("limitToLast"));
     }
 
-  #[test]
-fn url_equal_to_string_is_quoted() {
-    let url = make_builder("jobs")
-        .order_by_child("status")
-        .equal_to(FilterValue::string("active"))
-        .build_url()
-        .unwrap();
+    #[test]
+    fn url_equal_to_string_is_quoted() {
+        let url = make_builder("jobs")
+            .order_by_child("status")
+            .equal_to(FilterValue::string("active"))
+            .build_url()
+            .unwrap();
 
-    assert!(url.contains("equalTo=%22active%22"));
-}
+        assert!(url.contains("equalTo=%22active%22"));
+    }
 
     #[test]
     fn url_shallow() {
@@ -1108,10 +1201,7 @@ fn url_equal_to_string_is_quoted() {
         // shallow alone is valid for GET...
         assert!(result.is_ok());
         // ...but shallow + any filter is not
-        let result2 = make_builder("users")
-            .shallow()
-            .order_by_key()
-            .build_url();
+        let result2 = make_builder("users").shallow().order_by_key().build_url();
         assert!(matches!(result2, Err(RtdbError::InvalidQuery(_))));
     }
 }

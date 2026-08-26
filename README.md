@@ -53,6 +53,15 @@ let client = client.with_token(&new_token);
 * Google OAuth2 access tokens, usually beginning with `ya29`, are sent using `access_token=...`.
 * Firebase ID tokens and other token styles are sent using `auth=...`.
 
+For a local Realtime Database emulator, set the namespace explicitly. An empty
+token omits authentication, which is appropriate when emulator rules allow
+public access:
+
+```rust
+let client = RtdbClient::new("http://127.0.0.1:9000", "")
+    .with_namespace("demo-rtdb-typed");
+```
+
 ---
 
 ## Basic Usage
