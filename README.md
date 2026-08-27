@@ -1,16 +1,46 @@
 # rtdb-rs
 
-Firebase Realtime Database REST client for Rust. Handles service account auth, CRUD operations, filtered queries, push keys, and real-time SSE streaming over the Firebase REST API.
+Async Firebase Realtime Database REST and SSE transport for Rust.
 
 [![Crates.io](https://img.shields.io/crates/v/rtdb-rs.svg)](https://crates.io/crates/rtdb-rs)
 [![Docs.rs](https://docs.rs/rtdb-rs/badge.svg)](https://docs.rs/rtdb-rs)
 
-`rtdb-rs` is an async Firebase Realtime Database REST client with reusable
-clients, typed query construction, CRUD helpers, push-key writes, and
-Server-Sent Events (SSE) streaming. Version 0.3.2 also supports emulator
-namespaces and persistent query parameters.
+`rtdb-rs` is the transport foundation of a small Rust ecosystem for Firebase Realtime Database. It provides reusable HTTP clients, CRUD operations, Firebase query construction, push-key writes, namespaced emulator support, and realtime Server-Sent Events without imposing an ORM or application-state model.
 
----
+The current 0.3.2 release line also carries the transport capabilities required by the companion typed, admin, and synchronization crates.
+
+## RTDB Rust ecosystem
+
+```text
+application
+   |
+   +-- rtdb-sync
+   |     synchronized state, durable snapshots, offline journal,
+   |     reconnect/replay, reconciliation, conflict policy
+   |
+   +-- rtdb-typed
+   |     Serde models, typed CRUD, collections, queries, realtime events
+   |
+   +-- rtdb-admin
+   |     service-account loading, OAuth exchange, token lifecycle
+   |
+   `-- rtdb-rs
+         Firebase REST + query + SSE transport
+                  |
+                  v
+          Firebase Realtime Database
+```
+
+Each crate has a deliberately narrow responsibility:
+
+| Crate | Responsibility |
+| --- | --- |
+| [`rtdb-rs`](https://github.com/kab102395/rtdb-rs) | Raw Firebase RTDB REST, query, push-key, namespace, and SSE transport |
+| [`rtdb-typed`](https://github.com/kab102395/rtdb-typed) | Serde-first typed models, collections, queries, patches, and realtime events |
+| [`rtdb-admin`](https://github.com/kab102395/rtdb-admin) | Service-account credentials, OAuth exchange, expiry, refresh, and authenticated client lifecycle |
+| [`rtdb-sync`](https://github.com/kab102395/rtdb-sync) | Realtime synchronized Rust state, local writes, reconnect, durability, offline replay, and reconciliation |
+
+Use only the layers an application needs. `rtdb-rs` can be used by itself for maximum transport control. The companion crates build on it rather than duplicating its HTTP or SSE implementation.
 
 ## Installation
 
@@ -19,24 +49,7 @@ namespaces and persistent query parameters.
 rtdb-rs = "0.3.2"
 ```
 
----
-
-## Auth
-
-Get a service account JSON key from:
-
-**Firebase Console → Project Settings → Service Accounts**
-
-Then generate a signed JWT and exchange it for a Google OAuth2 access token:
-
-```rust
-use rtdb_rs::{generate_jwt, exchange_jwt_for_access_token};
-
-let jwt = generate_jwt(&private_key, &client_email).await?;
-let token = exchange_jwt_for_access_token(&jwt).await?;
-```
-
-Create a reusable client:
+## Client
 
 ```rust
 use rtdb_rs::RtdbClient;
@@ -47,51 +60,24 @@ let client = RtdbClient::new(
 );
 ```
 
-OAuth2 access tokens expire after about **1 hour**. Refresh the token and call `with_token()` when needed:
+For long-running service-account applications, prefer [`rtdb-admin`](https://github.com/kab102395/rtdb-admin) for credential loading and automatic token lifecycle management. `rtdb-rs` retains its lower-level JWT/OAuth helpers for callers that want to manage authentication directly.
+
+```rust
+use rtdb_rs::{exchange_jwt_for_access_token, generate_jwt};
+
+let jwt = generate_jwt(&private_key, &client_email).await?;
+let token = exchange_jwt_for_access_token(&jwt).await?;
+```
+
+OAuth2 access tokens are short-lived. A refreshed token can be applied with:
 
 ```rust
 let client = client.with_token(&new_token);
 ```
 
-`rtdb-rs` supports both common Firebase REST token styles:
+Google OAuth2 access tokens are sent using `access_token=...`; Firebase ID tokens and other token styles use `auth=...`.
 
-* Google OAuth2 access tokens, usually beginning with `ya29`, are sent using `access_token=...`.
-* Firebase ID tokens and other token styles are sent using `auth=...`.
-
-For a local Realtime Database emulator, set the namespace explicitly. An empty
-token omits authentication, which is appropriate when emulator rules allow
-public access:
-
-```rust
-let client = RtdbClient::new("http://127.0.0.1:9000", "")
-    .with_namespace("demo-rtdb-typed");
-```
-
-`with_namespace()` is applied to every REST and SSE request. This is useful for
-running multiple isolated Firebase emulator databases from one emulator
-process. Use `with_query_param()` for parameters that should persist across
-all requests, such as emulator auth overrides:
-
-```rust
-let client = RtdbClient::new("http://127.0.0.1:9000", "")
-    .with_namespace("demo-rtdb-typed")
-    .with_query_param("auth_variable_override", r#"{"uid":"test-user"}"#);
-```
-
-Namespace names, parameter names, and parameter values are percent-encoded.
-When the token is empty, no `auth=` or `access_token=` parameter is added.
-
----
-
-## Basic Usage
-
-Your database URL should look like this:
-
-```text
-https://<project-id>-default-rtdb.firebaseio.com
-```
-
-Example CRUD usage:
+## CRUD
 
 ```rust
 use rtdb_rs::RtdbClient;
@@ -102,47 +88,33 @@ let client = RtdbClient::new(
     &token,
 );
 
-// PUT: overwrite a node
-client
-    .put("users/alice", &json!({
-        "name": "Alice",
-        "score": 95
-    }))
-    .await?;
+client.put("users/alice", &json!({
+    "name": "Alice",
+    "score": 95
+})).await?;
 
-// GET: read a node
 let user = client.get("users/alice").await?;
 
-// PATCH: update specific fields without removing siblings
-client
-    .patch("users/alice", &json!({
-        "score": 100
-    }))
-    .await?;
+client.patch("users/alice", &json!({
+    "score": 100
+})).await?;
 
-// POST: create a Firebase push-key child
-let pushed = client
-    .post("logs", &json!({
-        "event": "login"
-    }))
-    .await?;
+let pushed = client.post("logs", &json!({
+    "event": "login"
+})).await?;
 
-// DELETE: remove a node
 client.delete("users/alice").await?;
 ```
 
-Missing nodes return `serde_json::Value::Null`, not a `NotFound` error.
-
----
+Firebase missing nodes normally deserialize as `serde_json::Value::Null` rather than producing an HTTP 404.
 
 ## Queries
 
-Use `client.query(path)` to build Firebase REST queries.
+`client.query(path)` builds Firebase REST queries while preserving the client namespace and persistent query parameters.
 
 ```rust
 use rtdb_rs::FilterValue;
 
-// Filter by child value
 let results = client
     .query("orders")
     .order_by_child("status")
@@ -151,7 +123,6 @@ let results = client
     .send()
     .await?;
 
-// Range query
 let range = client
     .query("events")
     .order_by_child("timestamp")
@@ -160,7 +131,6 @@ let range = client
     .send()
     .await?;
 
-// Keys only
 let keys = client
     .query("users")
     .shallow()
@@ -168,324 +138,114 @@ let keys = client
     .await?;
 ```
 
-The client’s namespace and persistent query parameters are preserved by query
-builders, including filtered and shallow queries. Call `build_url()` to inspect
-the resulting encoded URL before sending it.
+Supported ordering includes child, key, value, and priority ordering. Invalid Firebase query combinations are rejected before the request with `RtdbError::InvalidQuery`.
 
-Supported filter values:
+For production queries using `order_by_child`, configure the matching Firebase `.indexOn` rule.
 
-```rust
-FilterValue::string("pending")
-FilterValue::number(42.0)
-FilterValue::boolean(true)
-FilterValue::Null
-```
+## Realtime SSE
 
-Supported ordering methods:
-
-```rust
-.order_by_child("field")
-.order_by_key()
-.order_by_value()
-.order_by(OrderBy::Priority)
-```
-
-Firebase requires `order_by` before `limit_to_first`, `limit_to_last`, `start_at`, `end_at`, or `equal_to`. `rtdb-rs` validates this before sending the request and returns `RtdbError::InvalidQuery` for invalid combinations.
-
-### Indexing rules
-
-For production use, Firebase recommends indexing any child fields used with `order_by_child`.
-
-Example Firebase Realtime Database rules:
-
-```json
-{
-  "rules": {
-    "orders": {
-      ".indexOn": ["status", "timestamp"]
-    },
-    "users": {
-      ".indexOn": ["name", "score", "active"]
-    }
-  }
-}
-```
-
-`order_by_key()` does not require `.indexOn`.
-
----
-
-## SSE Streaming
-
-Firebase Realtime Database supports real-time updates over Server-Sent Events through the REST API. `rtdb-rs` exposes this through `client.stream(path)` and `query(...).stream()`.
+Firebase Realtime Database exposes realtime changes over Server-Sent Events. `rtdb-rs` supports both direct-path and filtered-query streams.
 
 ```rust
 use futures_util::StreamExt;
 use rtdb_rs::RtdbEvent;
 
-// Simple stream
 let stream = client.stream("users/alice").await?;
 tokio::pin!(stream);
 
 while let Some(event) = stream.next().await {
     match event? {
         RtdbEvent::Put { path, data } => {
-            println!("put at {}: {}", path, data);
+            println!("put at {path}: {data}");
         }
         RtdbEvent::Patch { path, data } => {
-            println!("patch at {}: {}", path, data);
+            println!("patch at {path}: {data}");
         }
-        RtdbEvent::KeepAlive => {
-            // Safe to ignore.
-        }
-        RtdbEvent::Cancel => {
-            // Token expired, permission changed, or stream was cancelled.
-            // Re-authenticate and reconnect.
-            break;
-        }
-    }
-}
-```
-
-The first event is normally a `Put` containing the current value at the streamed path. If the node is empty, the first `Put` contains `null`.
-
-Subsequent events reflect changes:
-
-* `Put` means the streamed node or child path was replaced.
-* `Patch` means fields were updated without replacing the full node.
-* `KeepAlive` is a Firebase heartbeat.
-* `Cancel` means the stream was cancelled by Firebase.
-
-### Filtered streams
-
-Queries can also be streamed:
-
-```rust
-use futures_util::StreamExt;
-use rtdb_rs::{FilterValue, RtdbEvent};
-
-let stream = client
-    .query("orders")
-    .order_by_child("status")
-    .equal_to(FilterValue::string("pending"))
-    .stream()
-    .await?;
-
-tokio::pin!(stream);
-
-while let Some(event) = stream.next().await {
-    match event? {
-        RtdbEvent::Put { path, data } => println!("put at {}: {}", path, data),
-        RtdbEvent::Patch { path, data } => println!("patch at {}: {}", path, data),
         RtdbEvent::KeepAlive => {}
         RtdbEvent::Cancel => break,
     }
 }
 ```
 
-Filtered streams follow the same indexing requirements as normal Firebase queries. If you use `order_by_child("status")`, add `.indexOn: ["status"]` at the matching database path.
+The first stream event is normally a `Put` containing the current value. `Put` represents replacement/deletion, `Patch` represents partial updates, `KeepAlive` is the Firebase heartbeat, and `Cancel` terminates the stream.
 
-For tests or simple filtered streaming without `.indexOn`, prefer `order_by_key()`:
+Filtered streams use the same query builder:
 
 ```rust
 let stream = client
     .query("orders")
-    .order_by_key()
-    .equal_to(FilterValue::string("order_2"))
+    .order_by_child("status")
+    .equal_to(FilterValue::string("pending"))
     .stream()
     .await?;
 ```
 
----
+## Emulator namespaces and persistent parameters
 
-## Debugging
-
-`build_url()` is public so you can inspect the exact Firebase REST URL before sending a request:
+For the local Firebase Realtime Database emulator, an empty token is supported when emulator rules permit unauthenticated access.
 
 ```rust
-let url = client
-    .query("orders")
-    .order_by_child("status")
-    .equal_to(FilterValue::string("pending"))
-    .build_url()?;
-
-println!("{}", url);
+let client = RtdbClient::new("http://127.0.0.1:9000", "")
+    .with_namespace("demo-rtdb-test");
 ```
 
-Query parameters are percent-encoded. For example:
+`with_namespace()` is propagated through CRUD, queries, shallow reads, and SSE requests. This allows multiple isolated logical databases to share one emulator process.
 
-```text
-orderBy=%22status%22
-equalTo=%22pending%22
-```
-
-This is expected. The encoded values represent Firebase’s required JSON-style query syntax:
-
-```text
-orderBy="status"
-equalTo="pending"
-```
-
----
-
-## Errors
-
-Common error handling pattern:
+Persistent parameters can be attached to every request:
 
 ```rust
-use rtdb_rs::RtdbError;
-
-match client.get("users/alice").await {
-    Ok(v) => {
-        if let Some(error) = v.get("error") {
-            eprintln!("Firebase error: {}", error);
-        } else {
-            println!("{}", v);
-        }
-    }
-    Err(RtdbError::Auth(e)) => {
-        eprintln!("auth error: {}", e);
-    }
-    Err(RtdbError::InvalidQuery(e)) => {
-        eprintln!("invalid query: {}", e);
-    }
-    Err(RtdbError::NotFound(path)) => {
-        eprintln!("not found: {}", path);
-    }
-    Err(e) => {
-        eprintln!("request failed: {}", e);
-    }
-}
+let client = RtdbClient::new("http://127.0.0.1:9000", "")
+    .with_namespace("demo-rtdb-test")
+    .with_query_param("auth_variable_override", r#"{"uid":"test-user"}"#);
 ```
 
-Firebase missing nodes usually return JSON `null`. They do not normally produce HTTP 404.
+Namespace names, parameter names, values, auth values, and Firebase query values are percent-encoded.
 
----
+## Typed, admin, and synchronized usage
 
-## Live Testing
+Applications that do not want to work directly with `serde_json::Value` can use [`rtdb-typed`](https://github.com/kab102395/rtdb-typed), which maps the same transport into typed Serde models, collections, queries, `TypedPatch`, and typed realtime events.
 
-### Local Firebase emulator
+Server-side applications can use [`rtdb-admin`](https://github.com/kab102395/rtdb-admin) to own service-account credentials, concurrent refresh, expiry handling, and authenticated `RtdbClient` replacement.
 
-The repository includes an ignored integration test covering namespaced CRUD,
-namespace isolation, filtered queries, URL encoding, empty-token requests,
-SSE initial and mutation events, SSE fan-out, and concurrent CRUD stress.
-Firebase CLI, Node.js, Java, and Rust are required:
+Applications that need maintained realtime state can use [`rtdb-sync`](https://github.com/kab102395/rtdb-sync). Its 0.4.0 line adds opt-in durable snapshots, persistent pending mutations, process-restart recovery, offline queueing, replay on reconnect, acknowledgement durability, explicit conflict policy, and synchronized typed state while delegating Firebase transport back to this crate.
+
+## Validation
+
+The repository contains deterministic tests plus an official local Firebase Realtime Database Emulator harness covering:
+
+- namespaced CRUD and namespace isolation
+- filtered and shallow queries
+- query/auth URL encoding
+- empty-token emulator requests
+- SSE initial state and subsequent `Put`/`Patch`/delete delivery
+- child-path and filtered streams
+- SSE fan-out
+- concurrent CRUD stress
+
+Run the emulator suite with:
 
 ```bash
 ./scripts/test-emulator.sh
 ```
 
-The runner refuses non-demo project IDs and refuses to start if ports 9000 or
-4000 are already in use. Set `FIREBASE_PROJECT_ID` only to another `demo-*`
-project when needed. The test uses the local database emulator and does not
-contact production Firebase.
+The runner accepts only `demo-*` project IDs and refuses to start when required emulator ports are already occupied.
 
-A separate live test harness can be used against a real Firebase Realtime Database project.
+The wider four-crate ecosystem has also been exercised together in `rtdb-sync` against the local emulator with mixed raw/typed/admin/sync traffic, real local sync writes, active subscribers, token refresh/client replacement, durable offline process-restart replay, concurrent remote writes during replay, repeated connection-boundary testing, and long-duration soak profiles. Those measurements are local correctness/stress evidence, not universal Firebase production-capacity guarantees.
 
-Set:
+## 0.3.2
 
-```text
-RTDB_BASE_URL
-RTDB_PRIVATE_KEY
-RTDB_CLIENT_EMAIL
-```
+The 0.3.2 line adds the transport capabilities needed by the companion ecosystem:
 
-Example:
+- `RtdbClient::with_namespace()` for Firebase emulator namespaces
+- `RtdbClient::with_query_param()` for persistent REST/SSE parameters
+- propagation of namespace and persistent parameters through CRUD, query, shallow, and SSE paths
+- omission of auth parameters for empty-token emulator clients
+- expanded official emulator and concurrency coverage
+- CI gates for formatting, Clippy, tests, and package validation
 
-```bash
-RTDB_BASE_URL="https://my-project-default-rtdb.firebaseio.com" \
-RTDB_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----..." \
-RTDB_CLIENT_EMAIL="service-account@my-project.iam.gserviceaccount.com" \
-cargo run
-```
+## Scope
 
-On Windows PowerShell:
-
-```powershell
-$env:RTDB_BASE_URL="https://my-project-default-rtdb.firebaseio.com"
-$env:RTDB_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----..."
-$env:RTDB_CLIENT_EMAIL="service-account@my-project.iam.gserviceaccount.com"
-cargo run
-```
-
-The live harness validates:
-
-* Auth token generation and exchange
-* GET, PUT, PATCH, POST, DELETE
-* Filtered queries
-* Shallow queries
-* SSE initial `Put`
-* SSE `Put` after write
-* SSE `Patch` after patch
-* SSE delete as `Put` with `null`
-* Child-path streams
-* Sequential stream events
-* Stream reconnect behavior
-* Large streamed payloads
-
----
-
-## Changelog
-
-### 0.3.2
-
-* Added `RtdbClient::with_namespace()` for Firebase emulator database namespaces.
-* Added `RtdbClient::with_query_param()` for persistent custom REST/SSE query parameters.
-* Propagated namespace and persistent parameters through direct CRUD, filtered queries, shallow queries, and SSE streams.
-* Omitted authentication query parameters when the client token is empty, enabling public emulator rules.
-* Added emulator integration and concurrency stress coverage.
-* Added continuous integration checks for formatting, Clippy, tests, and crate packaging.
-
-### 0.3.1
-
-* Fixed Firebase SSE authentication for Google OAuth2 access tokens by using `access_token=...`.
-* Preserved `auth=...` behavior for Firebase ID tokens and other token styles.
-* Added percent-encoding for auth tokens and query parameters.
-* Improved URL construction for filtered GET and SSE requests.
-* Updated tests to expect encoded Firebase query parameters.
-* Verified live SSE behavior against Firebase Realtime Database.
-
-### 0.3.0
-
-* Added SSE streaming via `client.stream()` and `query().stream()`.
-* Added `RtdbEvent` enum:
-
-  * `Put`
-  * `Patch`
-  * `KeepAlive`
-  * `Cancel`
-
-### 0.2.0
-
-* Added `RtdbClient` with reusable HTTP connection.
-* Added query builder:
-
-  * `order_by_child`
-  * `order_by_key`
-  * `order_by_value`
-  * `limit_to_first`
-  * `limit_to_last`
-  * `start_at`
-  * `end_at`
-  * `equal_to`
-  * `shallow`
-* Added `FilterValue` and `OrderBy` enums.
-* Added `post()` for Firebase push keys.
-* Added `RtdbError::InvalidQuery` with pre-send validation.
-* Made `build_url()` public for debugging.
-
-### 0.1.0
-
-* Added service account JWT generation.
-* Added JWT-to-access-token exchange.
-* Added basic REST helpers:
-
-  * `get`
-  * `put`
-  * `patch`
-  * `delete`
-
----
+`rtdb-rs` targets Firebase Realtime Database. It is not a Firestore, Storage, FCM, Remote Config, Functions deployment, or full Firebase Admin SDK replacement.
 
 ## License
 
